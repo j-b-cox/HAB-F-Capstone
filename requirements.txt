@@ -1,0 +1,13 @@
+earthaccess
+cartopy
+h5netcdf
+numpy
+pandas
+xarray
+dask
+bash_kernel
+xesmf
+pyESMF
+seaborn
+plotly
+xgboost
