@@ -14,16 +14,21 @@ Exports:
 
 import os
 import sys
-import numpy as np
-import xarray as xr
-import earthaccess
-from datetime import datetime, timedelta
-import pickle
 import time
+import pickle
 import random
 import logging
-from tqdm import tqdm
-from typing import List, Tuple, Dict
+import earthaccess
+
+import numpy  as np
+import pandas as pd
+import xarray as xr
+
+from tqdm     import tqdm
+from netCDF4  import Dataset
+from datetime import datetime, timedelta
+from typing   import List, Tuple, Dict, Union
+from scipy.interpolate import interp1d
 
 # ---------------------------
 # Logging setup
@@ -35,15 +40,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("multi_sensor_aggregator")
 
-
 # ---------------------------
 # Utility Functions
 # ---------------------------
 
 def parse_date_range(start_date: str, end_date: str) -> List[datetime]:
-    """
-    Parse YYYY-MM-DD strings into a list of datetime objects (inclusive).
-    """
     sd = datetime.strptime(start_date, "%Y-%m-%d")
     ed = datetime.strptime(end_date, "%Y-%m-%d")
     num_days = (ed - sd).days + 1
@@ -52,18 +53,32 @@ def parse_date_range(start_date: str, end_date: str) -> List[datetime]:
 
 def build_grid(
     bbox: Tuple[float, float, float, float],
-    resolution: float
+    resolution: Union[float, Tuple[float, float]]
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build latitude/longitude bins and centers for a given bounding box and resolution.
-    Returns (lat_bins, lon_bins, lat_centers, lon_centers).
+    Build grid bin edges and centers for given bbox and resolution.
+    resolution: either a single float (deg for both lat and lon) or a tuple (res_lat_deg, res_lon_deg).
+    bbox: (lon_min, lat_min, lon_max, lat_max).
+    Returns: (lat_bins, lon_bins, lat_centers, lon_centers).
     """
     lon_min, lat_min, lon_max, lat_max = bbox
-    lat_bins = np.arange(lat_min, lat_max + resolution, resolution)
-    lon_bins = np.arange(lon_min, lon_max + resolution, resolution)
+    if isinstance(resolution, tuple) or isinstance(resolution, list):
+        res_lat, res_lon = resolution
+    else:
+        res_lat = res_lon = resolution
+
+    # Build edges so that centers are spaced by res_lat / res_lon
+    lat_bins = np.arange(lat_min, lat_max + res_lat*0.5, res_lat)
+    lon_bins = np.arange(lon_min, lon_max + res_lon*0.5, res_lon)
+    # centers between bins
     lat_centers = 0.5 * (lat_bins[:-1] + lat_bins[1:])
     lon_centers = 0.5 * (lon_bins[:-1] + lon_bins[1:])
     return lat_bins, lon_bins, lat_centers, lon_centers
+
+
+def bbox_to_str(bbox: Tuple[float, float, float, float]) -> str:
+    """Convert bounding box to standardized string with 5 decimal places."""
+    return "_".join(f"{coord:.5f}" for coord in bbox)
 
 
 def safe_search(
@@ -72,27 +87,20 @@ def safe_search(
     bounding_box: Tuple[float, float, float, float],
     max_retries: int = 500
 ) -> List[dict]:
-    """
-    Wraps earthaccess.search_data with retry logic.
-    Returns list of granule metadata dicts or empty list on failure.
-    """
     retries = 0
     while True:
         try:
-            results = earthaccess.search_data(
+            return earthaccess.search_data(
                 short_name=short_name,
                 temporal=temporal,
                 bounding_box=bounding_box
             )
-            return results
         except Exception as e:
             retries += 1
             if retries >= max_retries:
-                logger.error(f"Search for {short_name} {temporal} failed after {max_retries} retries: {e}")
+                logger.error(f"Search for {short_name} {temporal} failed: {e}")
                 return []
-            wait = 5 + random.uniform(0, 3)
-            logger.warning(f"Search error ({short_name}, {temporal}): {e}. Retrying in {wait:.1f}s...")
-            time.sleep(wait)
+            time.sleep(5 + random.uniform(0, 3))
 
 
 def safe_download(
@@ -100,23 +108,16 @@ def safe_download(
     directory: str = "../Data/",
     max_retries: int = 5
 ) -> List[str]:
-    """
-    Wraps earthaccess.download with retry logic.
-    Returns list of local file paths downloaded, or empty list on failure.
-    """
     retries = 0
     while True:
         try:
-            paths = earthaccess.download(results, directory)
-            return paths
+            return earthaccess.download(results, directory)
         except Exception as e:
             retries += 1
             if retries >= max_retries:
-                logger.error(f"Download failed after {max_retries} retries: {e}")
+                logger.error(f"Download failed: {e}")
                 return []
-            wait = 5 + random.uniform(0, 3)
-            logger.warning(f"Download error: {e}. Retrying in {wait:.1f}s...")
-            time.sleep(wait)
+            time.sleep(5 + random.uniform(0, 3))
 
 
 # ---------------------------
@@ -180,137 +181,151 @@ def get_reference_wavelengths(
 # Granule Processing per Sensor
 # ---------------------------
 
-def process_granule_modis(
-    path: str,
-    wave_modis: np.ndarray,
-    lat_bins: np.ndarray,
-    lon_bins: np.ndarray,
-    cache_dir: str,
-    bbox: Tuple[float, float, float, float]
-):
+def process_granule_modis(path: str, bbox: tuple) -> (np.ndarray, np.ndarray):
     """
-    Extract MODIS L2 OC Rrs bands from a single .nc granule into a cache .npz file.
-    The .npz contains arrays: lat_idx, lon_idx, ch_idx, val.
+    Process a MODIS granule: mask fill, apply scale/offset, average over bbox.
+    Returns:
+      native_wls: 1D array of band wavelengths (floats)
+      native_means: 1D array of mean reflectance at those wavelengths
     """
-    base = os.path.basename(path)
-    cache_file = os.path.join(cache_dir, f"{base}.npz")
-    if os.path.exists(cache_file):
-        return
-
-    logger.info(f"Processing MODIS granule: {base}")
     try:
-        nav = xr.open_dataset(path, group="navigation_data")
-        lat = nav["latitude"].values
-        lon = nav["longitude"].values
+        ds = Dataset(path, "r")
+        lat = ds.groups['navigation_data'].variables['latitude'][:]
+        lon = ds.groups['navigation_data'].variables['longitude'][:]
 
-        rrs_ds = xr.open_dataset(path, group="geophysical_data")
-        lat_idx_list = []
-        lon_idx_list = []
-        ch_idx_list = []
-        val_list = []
-
-        for ch_idx, wl in enumerate(wave_modis):
-            var_name = f"Rrs_{int(round(wl))}"
-            if var_name not in rrs_ds:
-                continue
-            band = rrs_ds[var_name].values
-            mask = (
-                np.isfinite(band)
-                & (lat >= bbox[1]) & (lat <= bbox[3])
-                & (lon >= bbox[0]) & (lon <= bbox[2])
-            )
-            if not np.any(mask):
-                continue
-
-            lat_valid = lat[mask]
-            lon_valid = lon[mask]
-            val_valid = band[mask]
-
-            lat_idx = np.searchsorted(lat_bins, lat_valid) - 1
-            lon_idx = np.searchsorted(lon_bins, lon_valid) - 1
-
-            lat_idx_list.extend(lat_idx.tolist())
-            lon_idx_list.extend(lon_idx.tolist())
-            ch_idx_list.extend([ch_idx] * len(val_valid))
-            val_list.extend(val_valid.tolist())
-
-        np.savez_compressed(
-            cache_file,
-            lat_idx=np.array(lat_idx_list, dtype=np.int16),
-            lon_idx=np.array(lon_idx_list, dtype=np.int16),
-            ch_idx=np.array(ch_idx_list, dtype=np.int16),
-            val=np.array(val_list, dtype=np.float32),
+        lon_min, lat_min, lon_max, lat_max = bbox
+        region_mask = (
+            (lat >= lat_min) & (lat <= lat_max) &
+            (lon >= lon_min) & (lon <= lon_max)
         )
-        logger.info(f"Saved MODIS cache: {cache_file}")
+        if not np.any(region_mask):
+            ds.close()
+            return np.array([]), np.array([])
+
+        group = ds.groups['geophysical_data']
+        # Gather Rrs_* variables sorted by wavelength
+        rrs_vars = sorted([v for v in group.variables if v.startswith("Rrs_")],
+                          key=lambda v: float(v.split("_")[1]))
+        native_wls = []
+        native_means = []
+        for varname in rrs_vars:
+            var = group.variables[varname]
+            data_raw = var[:]  # may be masked array
+            # 1. Convert masked array to float with NaN
+            if isinstance(data_raw, np.ma.MaskedArray):
+                arr = data_raw.astype(np.float32).filled(np.nan)
+            else:
+                arr = data_raw.astype(np.float32)
+            # 2. Mask fill values
+            fill = None
+            try:
+                fill = var.getncattr("_FillValue")
+            except Exception:
+                try:
+                    fill = var.getncattr("fill_value")
+                except Exception:
+                    fill = None
+            if fill is not None:
+                arr[arr == fill] = np.nan
+            # 3. Apply scale/offset
+            try:
+                sf = var.getncattr("scale_factor")
+                arr = arr * sf
+            except Exception:
+                pass
+            try:
+                off = var.getncattr("add_offset")
+                arr = arr + off
+            except Exception:
+                pass
+            # 4. Average over the region
+            masked = np.where(region_mask, arr, np.nan)
+            mean_val = np.nanmean(masked)
+            native_wls.append(float(varname.split("_")[1]))
+            native_means.append(mean_val)
+        ds.close()
+
+        if not native_wls:
+            return np.array([]), np.array([])
+        return np.array(native_wls, dtype=float), np.array(native_means, dtype=np.float32)
 
     except Exception as e:
-        logger.error(f"Failed to process MODIS granule {base}: {e}")
+        print(f"[ERROR] process_granule_modis {path}: {e}")
+        return np.array([]), np.array([])
 
-
-def process_granule_s3(
-    path: str,
-    wave_s3: np.ndarray,
-    lat_bins: np.ndarray,
-    lon_bins: np.ndarray,
-    cache_dir: str,
-    bbox: Tuple[float, float, float, float]
-):
+def process_granule_sentinel(path: str, bbox: tuple) -> (np.ndarray, np.ndarray):
     """
-    Extract Sentinel-3 L2 EFR OC Rrs bands from a single .nc granule into a cache .npz file.
+    Process a Sentinel-3 granule: returns native wavelengths and mean reflectances.
     """
-    base = os.path.basename(path)
-    cache_file = os.path.join(cache_dir, f"{base}.npz")
-    if os.path.exists(cache_file):
-        return
-
-    logger.info(f"Processing Sentinel-3 granule: {base}")
     try:
-        nav = xr.open_dataset(path, group="navigation_data")
-        lat = nav["latitude"].values
-        lon = nav["longitude"].values
+        ds = Dataset(path, "r")
+        lat = ds.groups["navigation_data"].variables["latitude"][:]
+        lon = ds.groups["navigation_data"].variables["longitude"][:]
 
-        rrs_ds = xr.open_dataset(path, group="geophysical_data")
-        lat_idx_list = []
-        lon_idx_list = []
-        ch_idx_list = []
-        val_list = []
-
-        for ch_idx, wl in enumerate(wave_s3):
-            var_name = f"Rrs_{int(round(wl))}"
-            if var_name not in rrs_ds:
-                continue
-            band = rrs_ds[var_name].values
-            mask = (
-                np.isfinite(band)
-                & (lat >= bbox[1]) & (lat <= bbox[3])
-                & (lon >= bbox[0]) & (lon <= bbox[2])
-            )
-            if not np.any(mask):
-                continue
-
-            lat_valid = lat[mask]
-            lon_valid = lon[mask]
-            val_valid = band[mask]
-
-            lat_idx = np.searchsorted(lat_bins, lat_valid) - 1
-            lon_idx = np.searchsorted(lon_bins, lon_valid) - 1
-
-            lat_idx_list.extend(lat_idx.tolist())
-            lon_idx_list.extend(lon_idx.tolist())
-            ch_idx_list.extend([ch_idx] * len(val_valid))
-            val_list.extend(val_valid.tolist())
-
-        np.savez_compressed(
-            cache_file,
-            lat_idx=np.array(lat_idx_list, dtype=np.int16),
-            lon_idx=np.array(lon_idx_list, dtype=np.int16),
-            ch_idx=np.array(ch_idx_list, dtype=np.int16),
-            val=np.array(val_list, dtype=np.float32),
+        lon_min, lat_min, lon_max, lat_max = bbox
+        region_mask = (
+            (lat >= lat_min) & (lat <= lat_max) &
+            (lon >= lon_min) & (lon <= lon_max)
         )
-        logger.info(f"Saved Sentinel-3 cache: {cache_file}")
+        if not np.any(region_mask):
+            ds.close()
+            return np.array([]), np.array([])
+
+        gdata = ds.groups["geophysical_data"]
+        # Gather Rrs_* variables
+        items = []
+        for name in gdata.variables:
+            if name.startswith("Rrs_"):
+                try:
+                    wl = float(name.split("_")[1])
+                    items.append((wl, name))
+                except:
+                    pass
+        items.sort()
+        wls = []
+        means = []
+        for wl, name in items:
+            var = gdata.variables[name]
+            data_raw = var[:]
+            if isinstance(data_raw, np.ma.MaskedArray):
+                arr = data_raw.astype(np.float32).filled(np.nan)
+            else:
+                arr = data_raw.astype(np.float32)
+            # Mask fill
+            fill = None
+            try:
+                fill = var.getncattr("_FillValue")
+            except Exception:
+                try:
+                    fill = var.getncattr("fill_value")
+                except Exception:
+                    fill = None
+            if fill is not None:
+                arr[arr == fill] = np.nan
+            # Scale/offset
+            try:
+                sf = var.getncattr("scale_factor")
+                arr = arr * sf
+            except Exception:
+                pass
+            try:
+                off = var.getncattr("add_offset")
+                arr = arr + off
+            except Exception:
+                pass
+            masked = np.where(region_mask, arr, np.nan)
+            mean_val = np.nanmean(masked)
+            wls.append(wl)
+            means.append(mean_val)
+        ds.close()
+
+        if not wls:
+            return np.array([]), np.array([])
+        return np.array(wls, dtype=float), np.array(means, dtype=np.float32)
 
     except Exception as e:
-        logger.error(f"Failed to process Sentinel-3 granule {base}: {e}")
+        print(f"[ERROR] process_granule_sentinel {path}: {e}")
+        return np.array([]), np.array([])
 
 
 def process_granule_pace(
@@ -319,53 +334,136 @@ def process_granule_pace(
     lat_bins: np.ndarray,
     lon_bins: np.ndarray,
     cache_dir: str,
-    bbox: Tuple[float, float, float, float]
+    bbox: tuple,
+    combined_wavelengths: np.ndarray
 ):
     """
-    Extract PACE L2 AOP Rrs bands from a single .nc granule into a cache .npz file.
+    Extract PACE L2 AOP granule Rrs bands, apply QA mask, and interpolate to combined wavelengths.
+    Save results as .npz cache.
     """
     base = os.path.basename(path)
-    cache_file = os.path.join(cache_dir, f"{base}.npz")
+    bbox_str = "_".join(f"{coord:.5f}" for coord in bbox)
+    cache_file = os.path.join(cache_dir, f"{base}_{bbox_str}.npz")
     if os.path.exists(cache_file):
         return
 
-    logger.info(f"Processing PACE granule: {base}")
+    logger.info(f"Processing PACE granule with QA and interpolation: {base}")
     try:
-        nav = xr.open_dataset(path, group="navigation_data")
-        lat = nav["latitude"].values
-        lon = nav["longitude"].values
+        with xr.open_dataset(path, group="navigation_data") as nav:
+            lat = nav["latitude"].values
+            lon = nav["longitude"].values
 
-        # Rrs is stored as a 3D variable with coordinate “wavelength_3d”
-        rrs_ds = xr.open_dataset(path, group="geophysical_data")["Rrs"]
-        rrs_ds = rrs_ds.assign_coords(wavelength_3d=wave_pace)
+        with xr.open_dataset(path, group="geophysical_data") as ds:
+            # QA flags and masks
+            if "l2_flags" in ds:
+                flags = ds["l2_flags"].values
+                flag_masks = ds["l2_flags"].attrs.get("flag_masks", None)
+                flag_meanings = ds["l2_flags"].attrs.get("flag_meanings", "")
+                if flag_masks is not None:
+                    names = flag_meanings.split()
+                    mask_map = {name: np.uint32(mask) for name, mask in zip(names, flag_masks)}
+                else:
+                    mask_map = {}
+            else:
+                flags = None
+                mask_map = {}
 
-        lat_idx_list = []
-        lon_idx_list = []
-        ch_idx_list = []
-        val_list = []
+            rrs = ds["Rrs"].values  # shape: (bands, lat, lon) or (lat, lon, bands)?
+            # Confirm shape: Assume (bands, lat, lon)
+            # If (lat, lon, bands), transpose as needed
+            # Here let's assume (bands, lat, lon)
+            if rrs.shape[0] == len(wave_pace):
+                # good
+                pass
+            elif rrs.shape[-1] == len(wave_pace):
+                # transpose to (bands, lat, lon)
+                rrs = np.transpose(rrs, (2, 0, 1))
+            else:
+                raise ValueError("Unexpected shape for Rrs data")
 
-        for ch_idx, wl in enumerate(wave_pace):
-            band = rrs_ds.sel(wavelength_3d=wl, method="nearest").values
-            mask = (
-                np.isfinite(band)
-                & (lat >= bbox[1]) & (lat <= bbox[3])
-                & (lon >= bbox[0]) & (lon <= bbox[2])
+            undesired = [
+                "LAND", "CLDICE", "HIGLINT", "MODGLINT",
+                "STRAYLIGHT", "ATMFAIL", "ATMWARN", "NAVFAIL", "NAVWARN",
+                "SEAICE", "HISOLZEN", "HISATZEN", "COASTZ", "ABSAER",
+                "MAXAERITER", "FILTER", "BOWTIEDEL", "HIPOL", "PRODFAIL", "PRODWARN"
+            ]
+
+            lat_idx_list = []
+            lon_idx_list = []
+            ch_idx_list = []
+            val_list = []
+
+            # Prepare mask for each pixel based on QA and bbox
+            # We will process pixel by pixel to interpolate spectra
+            # But that's slow; let's vectorize better:
+
+            # Flatten lat/lon and spectra to 2D: pixels x bands
+            shape_orig = rrs.shape
+            n_bands, n_lat, n_lon = shape_orig
+
+            lat_flat = lat.flatten()
+            lon_flat = lon.flatten()
+            rrs_2d = rrs.reshape(n_bands, -1).T  # shape (npixels, n_bands)
+
+            # Build initial mask: finite, bbox, QA
+            finite_mask = np.all(np.isfinite(rrs_2d), axis=1)
+            bbox_mask = (lat_flat >= bbox[1]) & (lat_flat <= bbox[3]) & (lon_flat >= bbox[0]) & (lon_flat <= bbox[2])
+
+            qa_mask = np.ones_like(finite_mask, dtype=bool)
+            if flags is not None and mask_map:
+                flags_flat = flags.flatten()
+                for name in undesired:
+                    if name in mask_map:
+                        qa_mask &= (flags_flat & mask_map[name]) == 0
+
+            total_mask = finite_mask & bbox_mask & qa_mask
+
+            if not np.any(total_mask):
+                logger.info("No valid pixels after masking for granule %s", base)
+                return
+
+            valid_pixels_idx = np.where(total_mask)[0]
+            lat_valid = lat_flat[valid_pixels_idx]
+            lon_valid = lon_flat[valid_pixels_idx]
+            spectra_valid = rrs_2d[valid_pixels_idx, :]  # shape (n_valid, n_bands_native)
+
+            # Interpolate each pixel's spectrum to combined_wavelengths
+            # Using scipy interp1d for handling NaNs safely:
+
+            interp_func = interp1d(
+                wave_pace,
+                spectra_valid.T,
+                kind="linear",
+                bounds_error=False,
+                fill_value=np.nan,
+                assume_sorted=True,
             )
-            if not np.any(mask):
-                continue
+            spectra_interp = interp_func(combined_wavelengths).T  # shape (n_valid, n_combined)
 
-            lat_valid = lat[mask]
-            lon_valid = lon[mask]
-            val_valid = band[mask]
+            valid_pixel_mask = ~np.all(np.isnan(spectra_interp), axis=1)
+            lat_valid = lat_valid[valid_pixel_mask]
+            lon_valid = lon_valid[valid_pixel_mask]
+            spectra_interp = spectra_interp[valid_pixel_mask, :]
 
+            # Find indices for lat, lon bins
             lat_idx = np.searchsorted(lat_bins, lat_valid) - 1
             lon_idx = np.searchsorted(lon_bins, lon_valid) - 1
 
-            lat_idx_list.extend(lat_idx.tolist())
-            lon_idx_list.extend(lon_idx.tolist())
-            ch_idx_list.extend([ch_idx] * len(val_valid))
-            val_list.extend(val_valid.tolist())
+            # Store as sparse arrays (pixel-wise)
+            for pix_i in range(len(lat_valid)):
+                li = lat_idx[pix_i]
+                lj = lon_idx[pix_i]
+                if li < 0 or lj < 0 or li >= len(lat_bins) - 1 or lj >= len(lon_bins) - 1:
+                    continue  # skip out of range
 
+                for ch_i, val in enumerate(spectra_interp[pix_i]):
+                    if np.isfinite(val):
+                        lat_idx_list.append(li)
+                        lon_idx_list.append(lj)
+                        ch_idx_list.append(ch_i)
+                        val_list.append(val)
+
+        # Save to cache file
         np.savez_compressed(
             cache_file,
             lat_idx=np.array(lat_idx_list, dtype=np.int16),
@@ -373,143 +471,155 @@ def process_granule_pace(
             ch_idx=np.array(ch_idx_list, dtype=np.int16),
             val=np.array(val_list, dtype=np.float32),
         )
-        logger.info(f"Saved PACE cache: {cache_file}")
+        logger.info(f"Saved interpolated PACE cache: {cache_file}")
 
     except Exception as e:
         logger.error(f"Failed to process PACE granule {base}: {e}")
+
 
 
 # ---------------------------
 # Load Daily Data per Sensor
 # ---------------------------
 
-def load_daily_sensor(
+def load_daily_spectrum(
     date: datetime,
     sensor: str,
-    bbox: Tuple[float, float, float, float],
-    lat_bins: np.ndarray,
-    lon_bins: np.ndarray,
+    bbox: tuple,
     wave_dict: Dict[str, np.ndarray],
-    cache_dir: str
-) -> Tuple[np.ndarray, np.ndarray]:
+    data_dir: str,
+    cache_dir: str,
+    combined_wavelengths: np.ndarray
+) -> np.ndarray:
     """
-    Load and average Rrs for a single sensor on a given date.
-    Args:
-        date: datetime for the day.
-        sensor: sensor short name.
-        bbox: (lon_min, lat_min, lon_max, lat_max).
-        lat_bins, lon_bins: 1D arrays of bin edges.
-        wave_dict: Dict mapping sensor to its wavelength array.
-        cache_dir: Directory for caching .npz files.
-
-    Returns:
-        daily_avg: 3D array (nlat, nlon, n_bands_sensor) of daily-averaged reflectance.
-        wavelengths: 1D array of that sensor’s wavelengths.
+    For a given date and sensor, search granules, process each to get native wavelengths/means,
+    align by exact match to combined_wavelengths, accumulate sum & count, then return 1D daily spectrum.
+    Always returns a numeric np.ndarray of length len(combined_wavelengths) (NaNs if no data).
     """
     date_str = date.strftime("%Y-%m-%d")
     temporal = (date_str, date_str)
-    all_granules: List[dict] = []
 
-    # Determine which short_name(s) to search, which wavelength array to use, and which processor
+    # Choose process function based on sensor
     if sensor in ["MODISA_L2_OC", "MODIST_L2_OC"]:
         short_names = [sensor]
-        wave_ref = wave_dict[sensor]
         process_fn = process_granule_modis
-
     elif sensor in ["OLCIS3A_L2_EFR_OC", "OLCIS3B_L2_EFR_OC"]:
         short_names = [sensor]
-        wave_ref = wave_dict[sensor]
-        process_fn = process_granule_s3
-
+        process_fn = process_granule_sentinel
     elif sensor == "PACE_OCI_L2_AOP":
         short_names = ["PACE_OCI_L2_AOP"]
-        wave_ref = wave_dict[sensor]
         process_fn = process_granule_pace
-
     else:
         raise ValueError(f"Unsupported sensor: {sensor}")
 
-    # Search each relevant collection for that day
+    # 1) Search granules for that day
+    all_granules = []
     for sn in short_names:
-        results = safe_search(sn, temporal, bbox)
-        all_granules.extend(results)
-
-    nlat = len(lat_bins) - 1
-    nlon = len(lon_bins) - 1
-    n_bands = len(wave_ref)
-
-    # If nothing found, return a full-NaN daily array
+        try:
+            results = safe_search(sn, temporal, bbox)
+            all_granules.extend(results)
+        except Exception as e:
+            logger.warning(f"Search failed for {sn} on {date_str}: {e}")
     if not all_granules:
-        logger.warning(f"No granules for {sensor} on {date_str}. Returning all-NaNs.")
-        return np.full((nlat, nlon, n_bands), np.nan, dtype=np.float32), wave_ref
+        # No granules → return all-NaN spectrum
+        return np.full(len(combined_wavelengths), np.nan, dtype=np.float32)
 
-    # Download any granules that haven’t already been cached
-    to_download: List[dict] = []
+    # 2) Download missing granules
+    to_download = []
     for granule in all_granules:
         granule_id = granule.get("granule_id") or \
             granule["umm"]["DataGranule"]["ArchiveAndDistributionInformation"][0]["Name"]
         base = os.path.basename(granule_id)
-        cache_file = os.path.join(cache_dir, f"{base}.npz")
-        if not os.path.exists(cache_file):
+        local_nc = os.path.join(data_dir, base)
+        if not os.path.exists(local_nc):
             to_download.append(granule)
-
     if to_download:
-        logger.info(f"Downloading {len(to_download)} new granules for {sensor} on {date_str}…")
-        paths = safe_download(to_download, "../Data/")
+        logger.info(f"Downloading {len(to_download)} granules for {sensor} on {date_str}…")
+        paths = safe_download(to_download, data_dir)
         if not paths:
-            logger.error(f"Failed to download granules for {sensor} on {date_str}. Returning NaNs.")
-            return np.full((nlat, nlon, n_bands), np.nan, dtype=np.float32), wave_ref
-    else:
-        logger.info(f"All granules for {sensor} on {date_str} already cached.")
+            logger.error(f"Failed to download some granules for {sensor} on {date_str}")
+            # proceed with whatever local files exist
 
-    # Build a list of local .nc file paths
-    granule_paths: List[str] = []
+    # Prepare accumulators for the day
+    n_bands = len(combined_wavelengths)
+    sum_arr = np.zeros(n_bands, dtype=np.float64)
+    count_arr = np.zeros(n_bands, dtype=np.int32)
+    tol = 1e-6
+
+    # Ensure cache_dir exists
+    os.makedirs(cache_dir, exist_ok=True)
+    # Precompute bbox string for cache filenames
+    bbox_str = "_".join(f"{coord:.5f}" for coord in bbox)
+
     for granule in all_granules:
         granule_id = granule.get("granule_id") or \
             granule["umm"]["DataGranule"]["ArchiveAndDistributionInformation"][0]["Name"]
         base = os.path.basename(granule_id)
-        local_nc = os.path.join("../Data/", base)
-        granule_paths.append(local_nc)
-
-    # Accumulators: sum and count (per band, per pixel)
-    sum_all = np.zeros((n_bands, nlat, nlon), dtype=np.float64)
-    count_all = np.zeros((n_bands, nlat, nlon), dtype=np.int32)
-
-    for path in granule_paths:
-        base = os.path.basename(path)
-        cache_file = os.path.join(cache_dir, f"{base}.npz")
-
-        if not os.path.exists(cache_file):
-            process_fn(path, wave_ref, lat_bins, lon_bins, cache_dir, bbox)
-
-        if not os.path.exists(cache_file):
-            logger.error(f"Cache missing for granule {base}. Skipping.")
+        local_nc = os.path.join(data_dir, base)
+        if not os.path.exists(local_nc):
+            logger.warning(f"Granule file missing locally: {local_nc}; skipping")
             continue
 
-        data = np.load(cache_file)
-        lat_idx = data["lat_idx"]
-        lon_idx = data["lon_idx"]
-        ch_idx = data["ch_idx"]
-        val = data["val"]
+        # Cache filename for this granule+bbox
+        cache_file = os.path.join(cache_dir, f"{sensor}_{base}_{bbox_str}.npy")
 
-        # Accumulate
-        for j in range(len(val)):
-            li = lat_idx[j]
-            lj = lon_idx[j]
-            ci = ch_idx[j]
-            if 0 <= li < nlat and 0 <= lj < nlon and 0 <= ci < n_bands:
-                sum_all[ci, li, lj] += val[j]
-                count_all[ci, li, lj] += 1
+        # Attempt to load cached aligned spectrum
+        spec_aligned = None
+        if os.path.exists(cache_file):
+            try:
+                spec_loaded = np.load(cache_file)
+                # verify shape
+                if isinstance(spec_loaded, np.ndarray) and spec_loaded.shape == (n_bands,):
+                    spec_aligned = spec_loaded.astype(np.float32)
+                else:
+                    logger.debug(f"Cache file {cache_file} has wrong shape; will re-compute")
+            except Exception:
+                logger.debug(f"Failed to load cache {cache_file}; will re-compute")
 
-    # Compute daily average: sum / count, set zeros to NaN
-    with np.errstate(invalid="ignore", divide="ignore"):
-        daily_avg = sum_all / count_all
-        daily_avg[count_all == 0] = np.nan
+        if spec_aligned is None:
+            # Process granule to get native wavelengths and means
+            native_wls, native_means = process_fn(local_nc, bbox)
+            if native_wls is None or native_means is None:
+                # Treat as no data
+                logger.debug(f"{sensor} process_granule returned None for {local_nc}; skipping")
+                continue
+            if native_wls.size == 0 or native_means.size == 0:
+                # No valid bands in this granule
+                logger.debug(f"No valid native bands for {local_nc}; skipping")
+                continue
 
-    # Transpose to (nlat, nlon, n_bands)
-    daily_avg = np.transpose(daily_avg, (1, 2, 0)).astype(np.float32)
-    return daily_avg, wave_ref
+            # Build aligned spectrum array of length n_bands, init NaN
+            spec_aligned = np.full(n_bands, np.nan, dtype=np.float32)
+            # Align exact matches
+            for wl, mean in zip(native_wls, native_means):
+                if not np.isfinite(mean):
+                    continue
+                idx = np.where(np.isclose(combined_wavelengths, wl, atol=tol))[0]
+                if idx.size > 0:
+                    spec_aligned[idx[0]] = mean
+            # Save to cache
+            try:
+                np.save(cache_file, spec_aligned)
+            except Exception as e:
+                logger.debug(f"Failed to save cache {cache_file}: {e}")
 
+        # Accumulate this granule’s spec_aligned into sum/count
+        finite_mask = np.isfinite(spec_aligned)
+        if np.any(finite_mask):
+            sum_arr[finite_mask] += spec_aligned[finite_mask]
+            count_arr[finite_mask] += 1
+        else:
+            logger.debug(f"{local_nc}: aligned spectrum all NaN; skipping accumulation")
+
+    # After looping all granules, compute daily average
+    with np.errstate(divide='ignore', invalid='ignore'):
+        daily = sum_arr / count_arr
+    # Wherever count == 0, set NaN
+    daily[count_arr == 0] = np.nan
+    # Convert to float32
+    daily = daily.astype(np.float32)
+
+    return daily
 
 # ---------------------------
 # Channel Alignment & Averaging
@@ -561,111 +671,164 @@ def average_across_sensors(arrays_list: List[np.ndarray]) -> np.ndarray:
 # Main Aggregation Function
 # ---------------------------
 
-def aggregate_sensors(
+def aggregate_sensors_simple(
     start_date: str,
     end_date: str,
     bbox: Tuple[float, float, float, float],
     sensors: List[str],
-    resolution: float = 0.01,
     data_dir: str = "../Data/",
-    cache_dir: str = "../Cache/"
+    cache_dir: str = "../Cache/",
+    wave_dict: Dict[str, np.ndarray] = None,
+    combined_wavelengths: np.ndarray = None
 ) -> Tuple[np.ndarray, Dict]:
     """
-    Aggregate daily Rrs from multiple sensors over the given date range and bbox.
-    Args:
-        start_date: "YYYY-MM-DD"
-        end_date:   "YYYY-MM-DD"
-        bbox:       (lon_min, lat_min, lon_max, lat_max)
-        sensors:    List of sensor short names (e.g., ["MODISA_L2_OC", "PACE_OCI_L2_AOP", ...])
-        resolution: Grid resolution in degrees.
-        data_dir:   Directory for raw downloads.
-        cache_dir:  Directory for processed .npz cache files.
-
-    Returns:
-        ndarray_all: 4D numpy array of shape (n_days, nlat, nlon, n_bands_combined)
-        metadata:    Dict with keys:
-                      - "wavelengths": combined 1D wavelength array (nm),
-                      - "lat": lat_centers,
-                      - "lon": lon_centers,
-                      - "date_list": list of date strings.
+    For each day in [start_date, end_date], for each sensor compute daily spectrum via load_daily_spectrum,
+    then average across sensors. Returns arr: shape (n_days, n_bands) and meta with 'wavelengths' and 'dates'.
     """
-    # Authenticate Earthaccess
-    logger.info("Authenticating Earthdata…")
-    _ = earthaccess.login(persist=True)
+    # Parse dates
+    sd = datetime.strptime(start_date, "%Y-%m-%d")
+    ed = datetime.strptime(end_date, "%Y-%m-%d")
+    date_objs = [sd + timedelta(days=i) for i in range((ed - sd).days + 1)]
+    date_list_str = [d.strftime("%Y-%m-%d") for d in date_objs]
+    total_days = len(date_objs)
 
-    # Ensure directories exist
+    # Prepare wave_dict if None
+    if wave_dict is None:
+        wave_dict = {}
+        for sensor in sensors:
+            wave = get_reference_wavelengths(sensor, bbox)
+            wave = wave[wave <= 2300]
+            wave_dict[sensor] = wave
+
+    # Combined wavelengths
+    if combined_wavelengths is None:
+        all_waves = np.unique(np.concatenate([wave_dict[s] for s in sensors]))
+        combined_wavelengths = np.sort(all_waves)
+    n_bands = len(combined_wavelengths)
+
+    # Output array: (n_days, n_bands)
+    arr = np.full((total_days, n_bands), np.nan, dtype=np.float32)
+
+    # Ensure data_dir/cache_dir exist
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Build lat/lon grid
-    lat_bins, lon_bins, lat_centers, lon_centers = build_grid(bbox, resolution)
-    nlat, nlon = len(lat_centers), len(lon_centers)
-
-    # Retrieve reference wavelengths for each sensor separately
-    wave_dict: Dict[str, np.ndarray] = {}
-    for sensor in sensors:
-        wave = get_reference_wavelengths(sensor, bbox)
-        # Exclude wavelengths > 2300 nm
-        wave = wave[wave <= 2300]
-        wave_dict[sensor] = wave
-        logger.info(f"{sensor} wavelengths (<=2300 nm): {wave}")
-
-    # Build combined wavelength list (union across all sensors)
-    all_waves = [wave_dict[s] for s in sensors]
-    combined_wavelengths = np.unique(np.concatenate(all_waves))
-    logger.info(f"Combined wavelength count: {len(combined_wavelengths)}")
-
-    # Prepare date list
-    date_objs = parse_date_range(start_date, end_date)
-    total_days = len(date_objs)
-    date_list_str = [d.strftime("%Y-%m-%d") for d in date_objs]
-    logger.info(f"Aggregating {total_days} days from {start_date} to {end_date}…")
-
-    # Initialize final 4D array
-    n_bands_combined = len(combined_wavelengths)
-    ndarray_all = np.full(
-        (total_days, nlat, nlon, n_bands_combined),
-        np.nan,
-        dtype=np.float32
-    )
-
-    # Loop over each date
-    for day_idx, current_date in enumerate(tqdm(date_objs, desc="Processing dates")):
-        date_str = current_date.strftime("%Y-%m-%d")
-        logger.info(f"Processing {date_str} ({day_idx+1}/{total_days})")
-
-        # 1) Load each sensor’s daily average into 3D array
-        sensor_arrays: Dict[str, np.ndarray] = {}
-        sensor_waves: Dict[str, np.ndarray] = {}
+    for idx, date in enumerate(date_objs):
+        date_str = date_list_str[idx]
+        logger.info(f"Aggregating date {date_str} ({idx+1}/{total_days})")
+        per_sensor_specs = []
         for sensor in sensors:
-            daily_arr, wave_ref = load_daily_sensor(
-                date=current_date,
-                sensor=sensor,
-                bbox=bbox,
-                lat_bins=lat_bins,
-                lon_bins=lon_bins,
-                wave_dict=wave_dict,
-                cache_dir=cache_dir
-            )
-            sensor_arrays[sensor] = daily_arr  # (nlat, nlon, n_bands_sensor)
-            sensor_waves[sensor] = wave_ref
-
-        # 2) Align channels for each sensor to the combined wavelength axis
-        aligned = unify_channels(sensor_arrays, sensor_waves, combined_wavelengths)
-
-        # 3) Average across sensors (ignoring NaNs)
-        daily_combined = average_across_sensors(list(aligned.values()))  # (nlat, nlon, n_bands_combined)
-
-        # 4) Store into final array
-        ndarray_all[day_idx, :, :, :] = daily_combined
-
-    # Build metadata
-    metadata = {
+            try:
+                daily_spec = load_daily_spectrum(
+                    date=date,
+                    sensor=sensor,
+                    bbox=bbox,
+                    wave_dict=wave_dict,
+                    data_dir=data_dir,
+                    cache_dir=cache_dir,
+                    combined_wavelengths=combined_wavelengths
+                )
+                if daily_spec is None:
+                    # replace with all-NaN array of correct shape
+                    daily_spec = np.full(len(combined_wavelengths), np.nan, dtype=np.float32)
+                if np.all(np.isnan(daily_spec)):
+                    logger.info(f"Sensor {sensor} returned all-NaN on {date_str}")
+                else:
+                    per_sensor_specs.append(daily_spec)
+            except Exception as e:
+                logger.warning(f"Error loading daily spectrum for {sensor} on {date_str}: {e}")
+        if per_sensor_specs:
+            stacked = np.stack(per_sensor_specs, axis=0)
+            arr[idx] = np.nanmean(stacked, axis=0)
+        else:
+            logger.warning(f"No valid sensor data on {date_str}; leaving NaNs")
+    meta = {
         "wavelengths": combined_wavelengths,
-        "lat": lat_centers,
-        "lon": lon_centers,
-        "date_list": date_list_str
+        "dates": date_list_str
     }
+    return arr, meta
 
-    return ndarray_all, metadata
 
+def extract_mean_spectrum(
+    lat: float,
+    lon: float,
+    target_date: pd.Timestamp,
+    sensors: list,
+    bbox_size_km: float,
+    pixel_count: int,
+    data_dir: str,
+    cache_dir: str,
+    wave_dict: Dict[str, np.ndarray],
+    aggregate_fn,  # reference to aggregate_sensors
+):
+    """
+    For a single field observation at (lat, lon) and target_date, 
+    build a small bbox of size pixel_count × pixel_count at approx bbox_size_km per pixel,
+    call aggregate_sensors over ±4 days around target_date, and return a 1D mean spectrum
+    
+    Returns:
+      spectrum: 1D np.ndarray of length n_bands (with np.nan where no data)
+      wavelengths: 1D np.ndarray of length n_bands
+    """
+    # 1. Build bbox in degrees
+    res_lat = bbox_size_km / 111.0
+    res_lon = bbox_size_km / (111.0 * math.cos(math.radians(lat)))
+    half = pixel_count // 2
+    delta_lat = half * res_lat
+    delta_lon = half * res_lon
+    bbox = (lon - delta_lon, lat - delta_lat, lon + delta_lon, lat + delta_lat)
+
+    # 2. Time window ±4 days
+    start_date = target_date - pd.Timedelta(days=4)
+    end_date   = target_date + pd.Timedelta(days=4)
+
+    # 3. Call aggregate_sensors
+    arr4d, meta = aggregate_fn(
+        start_date=start_date,
+        end_date=end_date,
+        bbox=bbox,
+        sensors=sensors,
+        resolution=(res_lat, res_lon),
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        wave_dict=wave_dict
+    )
+    dates = meta.get("dates", meta.get("date_list", None))
+    # Depending on meta key: adjust if needed
+    # If date strings, convert to pd.Timestamp
+    if dates and not isinstance(dates[0], pd.Timestamp):
+        dates = [pd.to_datetime(d) for d in dates]
+    wavelengths = meta["wavelengths"]  # 1D array
+
+    # 4. Compute exponential weights over days
+    weights = np.array([np.exp(-abs((d - target_date).days)) for d in dates], dtype=float)
+    total = weights.sum()
+    if total <= 0:
+        # no valid weights
+        return None, wavelengths
+    weights /= total
+
+    # 5. Accumulate weighted mean per band over spatial pixels and days
+    n_days, h, w, n_bands = arr4d.shape
+    weighted_sum = np.zeros(n_bands, dtype=float)
+    weight_total = np.zeros(n_bands, dtype=float)
+
+    for i in range(n_days):
+        data_i = arr4d[i]  # shape (h, w, n_bands)
+        w_i = weights[i]
+        # reshape spatial dims
+        flat = data_i.reshape(-1, n_bands)  # (h*w, n_bands)
+        finite = np.isfinite(flat)  # mask
+        # sum & count per band
+        sum_b = np.nansum(np.where(finite, flat, 0.0), axis=0)
+        count_b = finite.sum(axis=0).astype(float)
+        valid = count_b > 0
+        if np.any(valid):
+            weighted_sum[valid] += w_i * (sum_b[valid] / count_b[valid])
+            weight_total[valid] += w_i
+
+    # 6. Build final spectrum
+    spectrum = np.full(n_bands, np.nan, dtype=np.float32)
+    valid_bands = weight_total > 0
+    spectrum[valid_bands] = weighted_sum[valid_bands].astype(np.float32)
+    return spectrum, wavelengths

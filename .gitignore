@@ -1,4 +1,9 @@
 Data/*
 Images/*
 Notebooks/.ipynb_checkpoints*
+PMN.csv
+LabelData_20250611/*
+LabelData/*
+Cache/*
+*.nc
 
