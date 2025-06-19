@@ -1,3 +1,4 @@
+pyresample
 tensorflow
 earthaccess
 cartopy
