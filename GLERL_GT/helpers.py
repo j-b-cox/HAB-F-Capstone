@@ -8,18 +8,75 @@ import numpy  as np
 import xarray as xr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import matplotlib.pyplot as plt
 
 from datetime import datetime
 from pyresample import geometry, kd_tree
 from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
 
-def extract_pace_patch(arr_stack, wavelengths, lon0, lat0, pixel_count, res_deg, lat_centers, lon_centers):
+def plot_granule(file, arr_stack, bbox, out_dir):
+
+    r_idx, g_idx, b_idx = 105, 75, 48
+
+    # extract each band and transpose so that we get (H, W)
+    r = arr_stack[r_idx, :, :].T
+    g = arr_stack[g_idx, :, :].T
+    b = arr_stack[b_idx, :, :].T
+
+    # stack into (H, W, 3)
+    rgb = np.dstack((r, g, b))
+
+    # normalize to [0,1] for display
+    rgb_min, rgb_max = np.nanmin(rgb), np.nanmax(rgb)
+    rgb_norm = (rgb - rgb_min) / (rgb_max - rgb_min)
+    fig, ax = plt.subplots(figsize=(8,6),
+                    subplot_kw={"projection": ccrs.PlateCarree()})
+
+    # Basemap
+    ax.set_facecolor("black")
+    ax.add_feature(cfeature.LAND.with_scale("10m"),
+                   facecolor="white", edgecolor="none")
+    ax.add_feature(cfeature.LAKES.with_scale("10m"),
+                   facecolor="black", zorder = 0)
+
+    extent = [bbox[0], bbox[2], bbox[1], bbox[3]]
+    rgb_rot = np.transpose(rgb_norm, (1, 0, 2))
+
+    ax.imshow(
+        rgb_rot,
+        origin="lower",
+        extent=extent,
+        transform=ccrs.PlateCarree(),
+        zorder=2,         # behind pcolormesh
+        interpolation="nearest"
+    )
+
+    # add coastlines, gridlines, colorbar as before…
+    ax.coastlines(resolution="10m")
+    gl = ax.gridlines(draw_labels=True, linestyle="--", linewidth=0.5)
+    gl.top_labels = False; gl.right_labels = False
+    
+    plt.tight_layout()
+    out_dir = out_dir + '/granules/'
+    filepath = extract_datetime_from_filename(file).strftime("%Y%m%d%H%M%S") + '.png'
+    plt.savefig(os.path.join(out_dir, filepath),
+                dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+def stretch(array, lower_percent=1, upper_percent=99):
+    """Apply histogram stretching based on percentiles."""
+    lower = np.nanpercentile(array, lower_percent)  # Calculate lower percentile
+    upper = np.nanpercentile(array, upper_percent)  # Calculate upper percentile
+    stretched = (array - lower) / (upper - lower)    # Stretch the data
+    return np.clip(stretched, 0, 1)  # Ensure the values are between 0 and 1
+
+def extract_pace_patch(arr_stack, wavelengths, lon0, lat0, pixel_count, lat_centers, lon_centers):
     """
     Given arr_stack shape (n_wl, ny, nx) on a regular lat/lon grid with resolution res_deg,
     extract a square patch of size pixel_count x pixel_count around (lat0, lon0) for each wavelength.
     Returns patch_dict mapping wavelength -> 2D array of shape (patch_count, patch_count).
     """
-    import numpy as np
+
     # Here we assume global arrays lat_centers, lon_centers are accessible (or pass them in).
     # Find nearest index:
     lat_idx = np.abs(lat_centers - lat0).argmin()
@@ -64,6 +121,13 @@ def process_pace_granule(filepath, bbox, sensor_params, wave_all):
             # Merge navigation coords if needed
             nav_ds = nav_ds.set_coords(("longitude", "latitude"))
             ds = xr.merge([geo_ds, nav_ds.coords])
+            ds = ds.where((
+                (ds["latitude"] > bbox[1]) & \
+                (ds["latitude"] < bbox[3]) & \
+                (ds["longitude"] > bbox[0]) & \
+                (ds["longitude"] < bbox[2])),
+            drop = True)
+
             # Assume reflectance variable is named "Rrs" with dims e.g. ("wavelength_3d", "y", "x") or ("wavelength_3d", "latitude", "longitude").
             rrs = ds["Rrs"]  # DataArray
             rrs = rrs.assign_coords(wavelength_3d = wave_all)
@@ -78,11 +142,7 @@ def process_pace_granule(filepath, bbox, sensor_params, wave_all):
     except Exception as e:
         raise RuntimeError(f"Failed to open or interpret PACE granule {filepath}: {e}")
 
-    # 2. Regrid: You need a regrid function that can handle a 3D DataArray. Two approaches:
-    #    a) Loop over wavelengths, regrid each 2D slice separately.
-    #    b) If your regrid supports multi-dim interpolation, pass the full 3D array.
-    # Here we illustrate option (a), assuming regrid_2d(arr2d, bbox, res) returns a 2D numpy array at target grid.
-    # Suppose sensor_params["res_km"] or similar defines resolution; adapt as needed.
+    # 2. Regrid: 
     regridded_slices = []
     for wl in wavelengths:
         # Select nearest wavelength slice
@@ -205,7 +265,7 @@ def get_granule_filename(item):
     # Extract filename
     return os.path.basename(url)
 
-def regrid_granule(dataset, bbox, res_km):
+def regrid_granule(dataset, bbox, res_km, chlor_a = False):
     lon_min, lat_min, lon_max, lat_max = bbox
     lat0 = (lat_min + lat_max) / 2.0
     res_lat_deg = res_km / 111.0
@@ -219,45 +279,80 @@ def regrid_granule(dataset, bbox, res_km):
     lats = dataset["latitude"].values.flatten()
 
     regridded = {}
-    bands = [name for name in dataset.data_vars if name.startswith("Rrs_")]
-    if not bands:
-        logging.warning("No Rrs_ bands in this granule")
-        return None
     mask = (
         (lons >= lon_min - 1.0) & (lons <= lon_max + 1.0) &
         (lats >= lat_min - 1.0) & (lats <= lat_max + 1.0)
     )
-    for band in bands:
-        logging.info(f"Regridding band {band}")
-        data = dataset[band].values.flatten()
-        # Treat zeros as missing
+    if not chlor_a:
+        bands = [name for name in dataset.data_vars if name.startswith("Rrs_")]
+        if not bands:
+            logging.warning("No Rrs_ bands in this granule")
+            return None
+        
+        for band in bands:
+            logging.info(f"Regridding band {band}")
+            data = dataset[band].values.flatten()
+            # Treat zeros as missing
+            data[data == 0] = np.nan
+            data_local = data[mask]
+            lons_local = lons[mask]
+            lats_local = lats[mask]
+            valid = ~np.isnan(data_local) & ~np.isnan(lons_local) & ~np.isnan(lats_local)
+
+            if not np.any(valid):
+                logging.warning(f"No valid data for band {band} in bbox region")
+                return None
+            swath_def = geometry.SwathDefinition(lons=lons_local[valid], lats=lats_local[valid])
+            try:
+                radius_m = res_km * 1000
+                result = kd_tree.resample_nearest(
+                    swath_def, data_local[valid], area_def,
+                    radius_of_influence=radius_m,
+                    fill_value=np.nan
+                )
+            except Exception as e:
+                logging.error(f"Resampling failed for band {band}: {e}")
+                return None
+            da = xr.DataArray(
+                result,
+                dims=("latitude", "longitude"),
+                coords={"latitude": target_lats, "longitude": target_lons},
+                name=band
+            )
+            regridded[band] = da
+    else:
+        data = dataset["chlor_a"].values.flatten()
+        
         data[data == 0] = np.nan
         data_local = data[mask]
         lons_local = lons[mask]
         lats_local = lats[mask]
+
         valid = ~np.isnan(data_local) & ~np.isnan(lons_local) & ~np.isnan(lats_local)
 
         if not np.any(valid):
-            logging.warning(f"No valid data for band {band} in bbox region")
+            logging.warning("No valid chlor_a data")
             return None
-        swath_def = geometry.SwathDefinition(lons=lons_local[valid], lats=lats_local[valid])
+    
+        swath_def = geometry.SwathDefinition(lons = lons_local[valid], lats = lats_local[valid])
+
         try:
             radius_m = res_km * 1000
             result = kd_tree.resample_nearest(
                 swath_def, data_local[valid], area_def,
-                radius_of_influence=radius_m,
-                fill_value=np.nan
+                radius_of_influence = radius_m,
+                fill_value = np.nan
             )
         except Exception as e:
-            logging.error(f"Resampling failed for band {band}: {e}")
+            logging.error(f"Resampling failed for chlor_a: {e}")
             return None
         da = xr.DataArray(
             result,
-            dims=("latitude", "longitude"),
-            coords={"latitude": target_lats, "longitude": target_lons},
-            name=band
-        )
-        regridded[band] = da
+            dims = ("latitude", "longitude"),
+            coords = {"latitude" : target_lats, "longitude" : target_lons},
+            name = "chlor_a")
+        regridded["chlor_a"] = da
+
     return regridded
 
 def regrid_pace_slice(slice_da, lat_arr, lon_arr, bbox, res_km):
@@ -295,6 +390,7 @@ def regrid_pace_slice(slice_da, lat_arr, lon_arr, bbox, res_km):
         (lons >= lon_min - 1.0) & (lons <= lon_max + 1.0) &
         (lats >= lat_min - 1.0) & (lats <= lat_max + 1.0)
     )
+    
     data_local = data[mask]
     lats_local = lats[mask]
     lons_local = lons[mask]

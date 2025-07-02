@@ -103,8 +103,7 @@ def process_granule(filepath, station_df, bbox, sensor_params,
 
             lat0, lon0 = estimate_position(times, lats, lons, t0)
             patch_dict = extract_pace_patch(arr_stack, wls, lon0, lat0,
-                                            sensor_params["pixel_count"],
-                                            res_deg=res_deg,
+                                            pixel_count = 1,
                                             lat_centers=lat_centers,
                                             lon_centers=lon_centers)  # or convert km to deg approx
             
@@ -149,7 +148,7 @@ def process_granule(filepath, station_df, bbox, sensor_params,
                 # Choose target wavelengths for true-color:
                 rgb_wls = {"R": 645.0, "G": 555.0, "B": 450.0}
                 data_vars = {}
-                for comp, target_wl in rgb_wls.items():
+                for _, target_wl in rgb_wls.items():
                     # find nearest index
                     wls = np.asarray(wls)  # if wls was a list or tuple of numbers
                     idx = int(np.argmin(np.abs(wls - target_wl)))
@@ -484,7 +483,7 @@ def process_all_granules(sensor="SENTINEL", test_year=None, test_month=None):
             "short_names": ["PACE_OCI_L2_AOP", "PACE_OCI_L2_AOP_NRT"],
             "start_date": datetime(2024,2,1),
             "res_km": 1.2,
-            "pixel_count": 5,
+            "pixel_count": 1,
         }
     }
     if sensor not in sensor_map:
@@ -685,5 +684,6 @@ def process_all_granules(sensor="SENTINEL", test_year=None, test_month=None):
 
 if __name__ == "__main__":
     # Example: change sensor here
+    logging.basicConfig(level=logging.INFO)
     process_all_granules(sensor="PACE")#, test_year = 2024, test_month = 7)
     balance_dataset_by_granule("PACE")

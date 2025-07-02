@@ -19,6 +19,7 @@ def balance_dataset_by_granule(sensor, max_granule_attempts=137, seed=42):
     Balance by iterating winter-month granules first.
     Handles PACE specially by using process_pace_granule and extract_pace_patch.
     """
+    logging.basicConfig(level=logging.INFO)
     logging.info(f"Starting granule-first balancing for sensor={sensor}")
     # Load station DataFrame
     df = pd.read_csv("glrl-hab-data.csv", index_col=0)
@@ -65,7 +66,7 @@ def balance_dataset_by_granule(sensor, max_granule_attempts=137, seed=42):
         "PACE": {
             "short_names": ["PACE_OCI_L2_AOP", "PACE_OCI_L2_AOP_NRT"],
             "res_km": 1.2,
-            "pixel_count": 5,
+            "pixel_count": 1,
         }
     }
     if sensor not in sensor_map:
@@ -320,7 +321,6 @@ def balance_dataset_by_granule(sensor, max_granule_attempts=137, seed=42):
                     patch_dict = extract_pace_patch(
                         arr_stack, wls, avg_lon, avg_lat,
                         params["pixel_count"],
-                        res_deg=params["res_km"]/111.0,  # unused inside but signature requires; lat_centers/lon_centers used
                         lat_centers=lat_centers,
                         lon_centers=lon_centers
                     )
